@@ -1,0 +1,8 @@
+{
+  "name": "Agora-Curator",
+  "version": "0.1.0",
+  "author": "Fernando Serena",
+  "email": "fernando.serena@centeropenmiddleware.com",
+  "github": "https://github.com/smartdeveloperhub/agora-stoa.git",
+  "description": "The service responsible for enriching resources that belong to a Linked Data Platform powered by Agora"
+}
