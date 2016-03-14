@@ -30,12 +30,13 @@ from threading import Thread
 
 from redis.lock import Lock
 
+from agora.stoa.actions.core import AGENT_ID
 from agora.stoa.client import get_query_generator
 from agora.stoa.daemons.delivery import build_response
 from agora.stoa.server import app
 from agora.stoa.store import r
 from agora.stoa.store.tables import db
-from agora.stoa.store.triples import cache
+from agora.stoa.store.triples import fragments_cache
 from concurrent.futures.thread import ThreadPoolExecutor
 
 __author__ = 'Fernando Serena'
@@ -47,6 +48,8 @@ ON_DEMAND_TH = float(app.config.get('PARAMS', {}).get('on_demand_threshold', 2.0
 MIN_SYNC = int(app.config.get('PARAMS', {}).get('min_sync_time', 10))
 MAX_CONCURRENT_FRAGMENTS = int(app.config.get('PARAMS', {}).get('max_concurrent_fragments', 8))
 
+fragments_key = '{}:fragments'.format(AGENT_ID)
+
 log.info("""Fragment daemon setup:
                     - On-demand threshold: {}
                     - Minimum sync time: {}
@@ -56,18 +59,22 @@ log.info("""Fragment daemon setup:
 thp = ThreadPoolExecutor(max_workers=min(8, MAX_CONCURRENT_FRAGMENTS))
 
 log.info('Cleaning fragment locks...')
-fragment_locks = r.keys('*lock*')
+fragment_locks = r.keys('{}:*lock*'.format(fragments_key))
 for flk in fragment_locks:
     r.delete(flk)
 
 log.info('Cleaning fragment pulling flags...')
-fragment_pullings = r.keys('fragments:*:pulling')
+fragment_pullings = r.keys('{}:*:pulling'.format(fragments_key))
 for fpk in fragment_pullings:
     r.delete(fpk)
 
 
 def fragment_lock(fid):
-    lock_key = 'fragments:{}:lock'.format(fid)
+    """
+    :param fid: Fragment id
+    :return: A redis-based lock object for a given fragment
+    """
+    lock_key = '{}:{}:lock'.format(fragments_key, fid)
     return r.lock(lock_key, lock_class=Lock)
 
 
@@ -90,7 +97,8 @@ def __load_fragment_requests(fid):
     :return: A dictionary of sinks of all fragment requests
     """
     sinks_ = {}
-    for rid in r.smembers('fragments:{}:requests'.format(fid)):
+    fragment_requests_key = '{}:{}:requests'.format(fragments_key, fid)
+    for rid in r.smembers(fragment_requests_key):
         try:
             sinks_[rid] = build_response(rid).sink
         except Exception, e:
@@ -98,13 +106,15 @@ def __load_fragment_requests(fid):
             log.warning(e.message)
             with r.pipeline(transaction=True) as p:
                 p.multi()
-                p.srem('fragments:{}:requests'.format(fid), rid)
+                p.srem(fragment_requests_key, rid)
                 p.execute()
     return sinks_
 
 
 def __pull_fragment(fid):
-    tps = r.smembers('fragments:{}:gp'.format(fid))
+    fragment_key = '{}:{}'.format(fragments_key, fid)
+
+    tps = r.smembers('{}:gp'.format(fragment_key))
     r_sinks = __load_fragment_requests(fid)
     log.info("""Starting collection of fragment {}:
                     - GP: {}
@@ -126,7 +136,7 @@ def __pull_fragment(fid):
 
     with r.pipeline(transaction=True) as p:
         p.multi()
-        p.set('fragments:{}:pulling'.format(fid), True)
+        p.set('{}:pulling'.format(fragment_key), True)
         p.execute()
 
     db[fid].delete_many({})
@@ -151,17 +161,17 @@ def __pull_fragment(fid):
     try:
         with r.pipeline(transaction=True) as p:
             p.multi()
-            sync_key = 'fragments:{}:sync'.format(fid)
+            sync_key = '{}:sync'.format(fragment_key)
             # Fragment is now synced
             p.set(sync_key, True)
             min_durability = int(MIN_SYNC)
             durability = random.randint(min_durability, min_durability * 2)
             p.expire(sync_key, durability)
             log.info('Fragment {} is considered synced for {} s'.format(fid, durability))
-            p.set('fragments:{}:updated'.format(fid), dt.now())
-            p.delete('fragments:{}:pulling'.format(fid))
+            p.set('{}:updated'.format(fragment_key), dt.now())
+            p.delete('{}:pulling'.format(fragment_key))
             p.execute()
-        if r.scard('fragments:{}:requests'.format(fid)) != len(r_sinks):
+        if r.scard('{}:requests'.format(fragment_key)) != len(r_sinks):
             r_sinks = __load_fragment_requests(fid)
         __notify_completion(r_sinks)
     finally:
@@ -169,8 +179,8 @@ def __pull_fragment(fid):
 
 
 def __collect_fragments():
-    registered_fragments = r.scard('fragments')
-    synced_fragments = len(r.keys('fragments:*:sync'))
+    registered_fragments = r.scard(fragments_key)
+    synced_fragments = len(r.keys('{}:*:sync'.format(fragments_key)))
     log.info("""Collector daemon started:
                     - Fragments: {}
                     - Synced: {}""".format(registered_fragments, synced_fragments))
@@ -178,9 +188,9 @@ def __collect_fragments():
     futures = {}
     while True:
         for fid in filter(
-                lambda x: r.get('fragments:{}:sync'.format(x)) is None and r.get(
-                    'fragments:{}:pulling'.format(x)) is None,
-                r.smembers('fragments')):
+                lambda x: r.get('{}:{}:sync'.format(fragments_key, x)) is None and r.get(
+                    '{}:{}:pulling'.format(fragments_key, x)) is None,
+                r.smembers(fragments_key)):
             if fid in futures:
                 if futures[fid].done():
                     del futures[fid]
@@ -190,15 +200,15 @@ def __collect_fragments():
 
 
 def fragment_updated_on(fid):
-    return r.get('fragments:{}:updated'.format(fid))
+    return r.get('{}:{}:updated'.format(fragments_key, fid))
 
 
 def fragment_on_demand(fid):
-    return r.get('fragments:{}:on_demand'.format(fid))
+    return r.get('{}:{}:on_demand'.format(fragments_key, fid))
 
 
 def is_pulling(fid):
-    return r.get('fragments:{}:pulling'.format(fid)) is not None
+    return r.get('{}:{}:pulling'.format(fragments_key, fid)) is not None
 
 
 def is_fragment_synced(fid):

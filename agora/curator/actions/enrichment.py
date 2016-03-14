@@ -29,8 +29,8 @@ import uuid
 from datetime import datetime
 
 from agora.curator.daemons.fragment import is_fragment_synced, fragment_lock
-from agora.stoa.actions.core import STOA, TYPES, RDF, XSD, FOAF
-from agora.stoa.actions.core.delivery import AGENT_UUID
+from agora.stoa.actions.core import STOA, TYPES, RDF, XSD, FOAF, AGENT_ID
+from agora.stoa.actions.core.delivery import LIT_AGENT_ID
 from agora.stoa.actions.core.fragment import FragmentRequest, FragmentAction, FragmentResponse, FragmentSink
 from agora.stoa.actions.core.utils import CGraph, GraphPattern
 from agora.stoa.store import r
@@ -43,8 +43,11 @@ __author__ = 'Fernando Serena'
 log = logging.getLogger('agora.curator.actions.enrichment')
 
 
+enrichments_key = '{}:enrichments'.format(AGENT_ID)
+
+
 def get_fragment_enrichments(fid):
-    return [EnrichmentData(eid) for eid in r.smembers('fragments:{}:enrichments'.format(fid))]
+    return [EnrichmentData(eid) for eid in r.smembers('{}:fragments:{}:enrichments'.format(AGENT_ID, fid))]
 
 
 def generate_enrichment_hash(target, links):
@@ -55,14 +58,14 @@ def generate_enrichment_hash(target, links):
 
 def register_enrichment(pipe, fid, target, links):
     e_hash = generate_enrichment_hash(target, links)
-    if not r.sismember('enrichments', e_hash):
+    if not r.sismember(enrichments_key, e_hash):
         eid = suuid()
         enrichment_data = EnrichmentData(eid, fid, target, links)
         enrichment_data.save(pipe)
-        pipe.sadd('enrichments', e_hash)
-        pipe.set('map:enrichments:{}'.format(e_hash), eid)
+        pipe.sadd(enrichments_key, e_hash)
+        pipe.set('{}:map:enrichments:{}'.format(AGENT_ID, e_hash), eid)
     else:
-        eid = r.get('map:enrichments:{}'.format(e_hash))
+        eid = r.get('{}:map:enrichments:{}'.format(AGENT_ID, e_hash))
     return eid
 
 
@@ -77,7 +80,7 @@ class EnrichmentData(object):
         self.target = target
         self.fragment_id = fid
         self.enrichment_id = eid
-        self._enrichment_key = 'enrichments:{}'.format(self.enrichment_id)
+        self._enrichment_key = '{}:enrichments:{}'.format(AGENT_ID, self.enrichment_id)
 
         if not any([fid, target, links]):
             self.load()
@@ -85,7 +88,7 @@ class EnrichmentData(object):
     def save(self, pipe):
         pipe.hset('{}'.format(self._enrichment_key), 'target', self.target)
         pipe.hset('{}'.format(self._enrichment_key), 'fragment_id', self.fragment_id)
-        pipe.sadd('fragments:{}:enrichments'.format(self.fragment_id), self.enrichment_id)
+        pipe.sadd('{}:fragments:{}:enrichments'.format(AGENT_ID, self.fragment_id), self.enrichment_id)
         pipe.sadd('{}:links'.format(self._enrichment_key), *map(lambda x: str(x), self.links))
         pipe.hmset('{}:links:status'.format(self._enrichment_key),
                    dict((pr, False) for (pr, _) in self.links))
@@ -188,7 +191,7 @@ class EnrichmentAction(FragmentAction):
 
 class EnrichmentSink(FragmentSink):
     def _remove(self, pipe):
-        pipe.srem('enrichments', self._request_id)
+        pipe.srem(enrichments_key, self._request_id)
         super(EnrichmentSink, self)._remove(pipe)
 
     def __init__(self):
@@ -275,7 +278,7 @@ class EnrichmentResponse(FragmentResponse):
         curator_node = BNode('#curator')
         graph.add((resp_node, STOA.submittedBy, curator_node))
         graph.add((curator_node, RDF.type, FOAF.Agent))
-        graph.add((curator_node, STOA.agentId, AGENT_UUID))
+        graph.add((curator_node, STOA.agentId, LIT_AGENT_ID))
         addition_node = BNode('#addition')
         graph.add((resp_node, STOA.additionTarget, addition_node))
         graph.add((addition_node, RDF.type, STOA.Variable))
